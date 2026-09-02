@@ -13,6 +13,7 @@ export interface BrowserTab {
   isMuted: boolean;
   isIncognito?: boolean;
   viewMode: 'browser' | 'reader' | 'source';
+  engineMode?: 'proxy' | 'direct';
 }
 
 export interface Bookmark {

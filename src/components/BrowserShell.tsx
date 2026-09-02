@@ -336,6 +336,7 @@ export const BrowserShell: React.FC = () => {
       title: title || getDomainFromUrl(finalUrl),
       favicon: favicon || getFaviconUrl(finalUrl),
       url: finalUrl,
+      inputUrl: finalUrl.startsWith('about:') ? '' : finalUrl,
       isLoading: false,
     });
   };
@@ -434,6 +435,7 @@ export const BrowserShell: React.FC = () => {
               onTitleChanged={handleTitleChanged}
               onNavigateInside={handleNavigateInside}
               onStartLoading={(id) => updateTab(id, { isLoading: true })}
+              onUpdateTab={updateTab}
             />
           )}
 

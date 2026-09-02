@@ -210,6 +210,15 @@ class CookieJar {
 
 const cookieJar = new CookieJar();
 
+// Initialize default consent cookies to prevent Google/YouTube blocking and consent redirects
+cookieJar.setCookiesFromHeader([
+  'SOCS=CAESEwgDEgk2ODEwNjM1NzQaAmVuIAEaBgiA_LyaBg; Domain=.youtube.com; Path=/',
+  'CONSENT=YES+cb.20240101-00-p0.en+FX+999; Domain=.youtube.com; Path=/',
+  'PREF=f6=400&f5=30000; Domain=.youtube.com; Path=/',
+  'SOCS=CAESEwgDEgk2ODEwNjM1NzQaAmVuIAEaBgiA_LyaBg; Domain=.google.com; Path=/',
+  'CONSENT=YES+cb.20240101-00-p0.en+FX+999; Domain=.google.com; Path=/',
+], 'https://www.youtube.com/');
+
 // SSRF Protection: block loopback and private IP addresses
 function isSafeUrl(targetUrl: string): { safe: boolean; reason?: string } {
   try {
@@ -265,35 +274,53 @@ function isAdDomain(url: string): boolean {
 }
 
 // Generate realistic browser headers for anti-detection / Google compliance
-function getBrowserHeaders(targetUrl: string, customUserAgent?: string): Record<string, string> {
-  const ua = customUserAgent || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+function getBrowserHeaders(targetUrl: string, customUserAgent?: string, isAsset = false): Record<string, string> {
+  const ua = customUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   const cookieHeader = cookieJar.getCookieHeader(targetUrl);
+  let origin = '';
+  try {
+    origin = new URL(targetUrl).origin;
+  } catch {}
+
+  if (isAsset) {
+    const headers: Record<string, string> = {
+      'User-Agent': ua,
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-CH-UA': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'Sec-CH-UA-Mobile': '?0',
+      'Sec-CH-UA-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+    };
+    if (origin) {
+      headers['Referer'] = `${origin}/`;
+      headers['Origin'] = origin;
+    }
+    if (cookieHeader) {
+      headers['Cookie'] = cookieHeader;
+    }
+    return headers;
+  }
 
   const headers: Record<string, string> = {
     'User-Agent': ua,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Sec-CH-UA': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+    'Sec-CH-UA': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     'Sec-CH-UA-Mobile': '?0',
-    'Sec-CH-UA-Platform': '"macOS"',
+    'Sec-CH-UA-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'document',
     'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Site': 'none',
     'Sec-Fetch-User': '?1',
     'Upgrade-Insecure-Requests': '1',
-    'Cache-Control': 'max-age=0',
   };
 
   if (cookieHeader) {
     headers['Cookie'] = cookieHeader;
   }
-
-  try {
-    const parsed = new URL(targetUrl);
-    headers['Host'] = parsed.host;
-    headers['Referer'] = `${parsed.protocol}//${parsed.host}/`;
-  } catch {}
 
   return headers;
 }
@@ -306,6 +333,7 @@ async function fetchWithRedirects(
     body?: any;
     headers?: Record<string, string>;
     userAgent?: string;
+    isAsset?: boolean;
   } = {},
   maxRedirects = 10
 ): Promise<{ response: Response; finalUrl: string; redirectChain: string[] }> {
@@ -316,7 +344,7 @@ async function fetchWithRedirects(
 
   for (let i = 0; i < maxRedirects; i++) {
     const headers = {
-      ...getBrowserHeaders(currentUrl, options.userAgent),
+      ...getBrowserHeaders(currentUrl, options.userAgent, options.isAsset),
       ...(options.headers || {}),
     };
 
@@ -334,7 +362,6 @@ async function fetchWithRedirects(
     const res = await fetch(currentUrl, requestInit);
 
     // Capture Set-Cookie headers from this hop
-    // In standard fetch, getSetCookie() returns all set-cookie headers
     if (typeof (res.headers as any).getSetCookie === 'function') {
       const setCookies = (res.headers as any).getSetCookie();
       cookieJar.setCookiesFromHeader(setCookies, currentUrl);
@@ -353,7 +380,7 @@ async function fetchWithRedirects(
         redirectChain.push(nextUrl);
         currentUrl = nextUrl;
 
-        // 302 / 303 redirects typically convert POST into GET
+        // 302 / 303 redirects convert POST into GET
         if (res.status === 303 || res.status === 302) {
           currentMethod = 'GET';
           currentBody = undefined;
@@ -530,15 +557,808 @@ app.get('/api/fetch', async (req, res) => {
 });
 
 // -------------------------------------------------------------
+// Comprehensive HTML Rewriter & Bridge Injector
+// -------------------------------------------------------------
+function rewriteHtmlPage(html: string, finalUrl: string, blockAds: boolean, userAgent: string): string {
+  const root = parse(html);
+
+  // 1. Strip CSP, X-Frame-Options and Frame-busting meta headers
+  root.querySelectorAll('meta[http-equiv="Content-Security-Policy" i], meta[http-equiv="content-security-policy" i], meta[http-equiv="X-Frame-Options" i], meta[http-equiv="x-frame-options" i], meta[http-equiv="Cross-Origin-Opener-Policy" i], meta[http-equiv="Cross-Origin-Embedder-Policy" i]').forEach((el) => el.remove());
+
+  // 2. Ensure <head> exists
+  let head = root.querySelector('head');
+  if (!head) {
+    const bodyEl = root.querySelector('body');
+    if (bodyEl) {
+      bodyEl.insertAdjacentHTML('beforebegin', '<head></head>');
+      head = root.querySelector('head');
+    }
+  }
+
+  // NOTE: We deliberately DO NOT inject <base href="..."> here, as <base> overrides relative API routes like /api/proxy/...
+  if (head) {
+    head.querySelectorAll('base').forEach((b) => b.remove());
+  }
+
+  // 3. Rewrite anchor links
+  root.querySelectorAll('a').forEach((el) => {
+    const href = el.getAttribute('href');
+    if (href && !href.startsWith('#') && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
+      try {
+        const absolute = new URL(href, finalUrl).toString();
+        el.setAttribute('href', `/api/proxy/page?url=${encodeURIComponent(absolute)}&blockAds=${blockAds}`);
+        el.setAttribute('target', '_self');
+        el.setAttribute('data-original-href', absolute);
+      } catch {}
+    }
+  });
+
+  // 4. Rewrite forms (supports POST & GET)
+  root.querySelectorAll('form').forEach((el) => {
+    const action = el.getAttribute('action') || '';
+    try {
+      const absolute = new URL(action, finalUrl).toString();
+      el.setAttribute('action', `/api/proxy/page`);
+      el.setAttribute('data-original-action', absolute);
+      
+      el.insertAdjacentHTML('afterbegin', `
+        <input type="hidden" name="__proxy_target_url" value="${encodeURIComponent(absolute)}" />
+        <input type="hidden" name="__proxy_user_agent" value="${userAgent}" />
+        <input type="hidden" name="__proxy_block_ads" value="${blockAds ? 'true' : 'false'}" />
+      `);
+    } catch {}
+  });
+
+  // 5. Rewrite stylesheets
+  root.querySelectorAll('link').forEach((el) => {
+    const href = el.getAttribute('href');
+    if (href) {
+      if (blockAds && isAdDomain(href)) {
+        el.remove();
+        return;
+      }
+      try {
+        const absolute = new URL(href, finalUrl).toString();
+        el.setAttribute('href', `/api/proxy/asset?url=${encodeURIComponent(absolute)}`);
+      } catch {}
+    }
+  });
+
+  // 6. Rewrite scripts
+  root.querySelectorAll('script').forEach((el) => {
+    const src = el.getAttribute('src');
+    if (src) {
+      if (blockAds && isAdDomain(src)) {
+        el.remove();
+        return;
+      }
+      try {
+        const absolute = new URL(src, finalUrl).toString();
+        el.setAttribute('src', `/api/proxy/asset?url=${encodeURIComponent(absolute)}`);
+      } catch {}
+    }
+  });
+
+  // 7. Rewrite IFRAMES to /api/proxy/page (CRUCIAL: Prevents recursive browser-in-browser inception!)
+  root.querySelectorAll('iframe, frame').forEach((el) => {
+    const src = el.getAttribute('src');
+    if (src && !src.startsWith('javascript:') && !src.startsWith('about:')) {
+      if (blockAds && isAdDomain(src)) {
+        el.remove();
+        return;
+      }
+      try {
+        const absolute = new URL(src, finalUrl).toString();
+        el.setAttribute('src', `/api/proxy/page?url=${encodeURIComponent(absolute)}&blockAds=${blockAds}`);
+      } catch {}
+    }
+  });
+
+  // 8. Rewrite media and images
+  root.querySelectorAll('img, video, audio, source, track, embed, object').forEach((el) => {
+    const src = el.getAttribute('src');
+    if (src && !src.startsWith('data:') && !src.startsWith('blob:')) {
+      if (blockAds && isAdDomain(src)) {
+        el.remove();
+        return;
+      }
+      try {
+        const absolute = new URL(src, finalUrl).toString();
+        el.setAttribute('src', `/api/proxy/asset?url=${encodeURIComponent(absolute)}`);
+      } catch {}
+    }
+    const srcset = el.getAttribute('srcset');
+    if (srcset) {
+      try {
+        const newSrcset = srcset.split(',').map((part) => {
+          const [url, size] = part.trim().split(/\s+/);
+          if (!url) return part;
+          const absolute = new URL(url, finalUrl).toString();
+          return `${`/api/proxy/asset?url=${encodeURIComponent(absolute)}`} ${size || ''}`.trim();
+        }).join(', ');
+        el.setAttribute('srcset', newSrcset);
+      } catch {}
+    }
+  });
+
+  const isGoogleAuthPage = finalUrl.includes('accounts.google.com') || finalUrl.includes('google.com/signin');
+
+  // 9. Client-Side Proxy Bridge Script
+  const bridgeScript = `
+    <script id="__browser_proxy_bridge__">
+      (function() {
+        const CURRENT_URL = ${JSON.stringify(finalUrl)};
+        const IS_GOOGLE_AUTH = ${isGoogleAuthPage ? 'true' : 'false'};
+
+        // 1. Guard window.top and window.parent against frame-busting / browser inception
+        try {
+          Object.defineProperty(window, 'top', { get: function() { return window.self; }, configurable: true });
+          Object.defineProperty(window, 'parent', { get: function() { return window.self; }, configurable: true });
+        } catch(e) {}
+
+        // 2. Safe ServiceWorker stub (Prevents modern SPAs like Neal.fun from crashing if SW fails in sandbox)
+        if ('serviceWorker' in navigator) {
+          try {
+            const fakeReg = {
+              scope: location.href,
+              installing: null,
+              waiting: null,
+              active: null,
+              navigationPreload: {
+                enable: function() { return Promise.resolve(); },
+                disable: function() { return Promise.resolve(); },
+                setHeaderValue: function() { return Promise.resolve(); },
+                getState: function() { return Promise.resolve({}); }
+              },
+              pushManager: {
+                getSubscription: function() { return Promise.resolve(null); },
+                subscribe: function() { return Promise.reject(new Error('Push not supported')); },
+                permissionState: function() { return Promise.resolve('denied'); }
+              },
+              sync: { register: function() { return Promise.resolve(); } },
+              periodicSync: { register: function() { return Promise.resolve(); } },
+              update: function() { return Promise.resolve(); },
+              unregister: function() { return Promise.resolve(true); },
+              addEventListener: function() {},
+              removeEventListener: function() {},
+              dispatchEvent: function() { return true; }
+            };
+            navigator.serviceWorker.register = function() { return Promise.resolve(fakeReg); };
+            navigator.serviceWorker.getRegistration = function() { return Promise.resolve(fakeReg); };
+            navigator.serviceWorker.getRegistrations = function() { return Promise.resolve([fakeReg]); };
+            navigator.serviceWorker.ready = Promise.resolve(fakeReg);
+            try {
+              Object.defineProperty(navigator.serviceWorker, 'controller', { get: function() { return null; }, configurable: true });
+            } catch(e) {}
+          } catch(e) {}
+        }
+
+        // 3. Intercept window.fetch for relative SPA requests & CORS assets (Neal.fun, YouTube, Next.js)
+        const origFetch = window.fetch;
+        window.fetch = function(input, init) {
+          try {
+            let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+            if (url && !url.startsWith('data:') && !url.startsWith('blob:') && !url.startsWith('/api/proxy/')) {
+              const resolved = new URL(url, CURRENT_URL).toString();
+              const proxiedUrl = '/api/proxy/asset?url=' + encodeURIComponent(resolved);
+              if (typeof input === 'string') {
+                input = proxiedUrl;
+              } else if (input instanceof Request) {
+                input = new Request(proxiedUrl, init || input);
+              }
+            }
+          } catch(e) {}
+          return origFetch.call(this, input, init);
+        };
+
+        // 4. Intercept XMLHttpRequest.prototype.open
+        const origXhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          try {
+            if (typeof url === 'string' && !url.startsWith('data:') && !url.startsWith('blob:') && !url.startsWith('/api/proxy/')) {
+              const resolved = new URL(url, CURRENT_URL).toString();
+              url = '/api/proxy/asset?url=' + encodeURIComponent(resolved);
+            }
+          } catch(e) {}
+          return origXhrOpen.call(this, method, url, ...rest);
+        };
+
+        // 5. Notify parent of successful page load
+        function notifyParentLoaded(newUrl, newTitle) {
+          try {
+            window.parent.postMessage({
+              type: 'BROWSER_PAGE_LOADED',
+              url: newUrl || CURRENT_URL,
+              title: newTitle || document.title || CURRENT_URL,
+              favicon: (document.querySelector("link[rel*='icon']") || {}).href || '',
+              isAuthPage: IS_GOOGLE_AUTH || (newUrl || CURRENT_URL).includes('login') || (newUrl || CURRENT_URL).includes('signin') || (newUrl || CURRENT_URL).includes('oauth')
+            }, '*');
+          } catch(e) {}
+        }
+
+        // Send initial load notification
+        if (document.readyState === 'complete') {
+          notifyParentLoaded(CURRENT_URL, document.title);
+        } else {
+          window.addEventListener('DOMContentLoaded', function() {
+            notifyParentLoaded(CURRENT_URL, document.title);
+          });
+          window.addEventListener('load', function() {
+            notifyParentLoaded(CURRENT_URL, document.title);
+          });
+        }
+
+        // 6. Intercept SPA URL changes via history.pushState & replaceState
+        const origPushState = history.pushState;
+        history.pushState = function(state, unused, url) {
+          const res = origPushState.apply(this, arguments);
+          if (url) {
+            try {
+              const fullUrl = new URL(url, CURRENT_URL).toString();
+              notifyParentLoaded(fullUrl, document.title);
+            } catch(e) {}
+          }
+          return res;
+        };
+
+        const origReplaceState = history.replaceState;
+        history.replaceState = function(state, unused, url) {
+          const res = origReplaceState.apply(this, arguments);
+          if (url) {
+            try {
+              const fullUrl = new URL(url, CURRENT_URL).toString();
+              notifyParentLoaded(fullUrl, document.title);
+            } catch(e) {}
+          }
+          return res;
+        };
+
+        // 7. Intercept window.open for popups
+        const originalOpen = window.open;
+        window.open = function(url, target, features) {
+          try {
+            const fullUrl = new URL(url, CURRENT_URL).toString();
+            window.parent.postMessage({
+              type: 'BROWSER_POPUP_REQUESTED',
+              url: fullUrl,
+              target: target || '_blank'
+            }, '*');
+            return null;
+          } catch(e) {
+            return originalOpen.apply(this, arguments);
+          }
+        };
+
+        // 8. Observe title changes
+        try {
+          const titleEl = document.querySelector('title');
+          if (titleEl) {
+            const observer = new MutationObserver(function() {
+              window.parent.postMessage({
+                type: 'BROWSER_TITLE_CHANGED',
+                title: document.title,
+                url: CURRENT_URL
+              }, '*');
+            });
+            observer.observe(titleEl, { childList: true, characterData: true, subtree: true });
+          }
+        } catch(e) {}
+
+        // 9. Passive click listener for loading state (non-capturing so drag/drop & chess pieces are never blocked)
+        document.addEventListener('click', function(e) {
+          const anchor = e.target && e.target.closest ? e.target.closest('a') : null;
+          if (anchor && anchor.href) {
+            const href = anchor.getAttribute('href') || '';
+            if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+              try {
+                window.parent.postMessage({ type: 'BROWSER_START_LOADING' }, '*');
+              } catch(e) {}
+            }
+          }
+        }, false);
+
+        // 10. Non-capturing form submission
+        document.addEventListener('submit', function(e) {
+          const form = e.target;
+          if (!form) return;
+          const originalAction = form.getAttribute('data-original-action') || form.action;
+          if (originalAction && !form.querySelector('input[name="__proxy_target_url"]')) {
+            const hidden = document.createElement('input');
+            hidden.type = 'hidden';
+            hidden.name = '__proxy_target_url';
+            hidden.value = originalAction;
+            form.appendChild(hidden);
+          }
+          try {
+            window.parent.postMessage({ type: 'BROWSER_START_LOADING' }, '*');
+          } catch(e) {}
+        }, false);
+
+        // 11. Listen for parent messages (Dark mode)
+        window.addEventListener('message', function(event) {
+          if (event.data && event.data.type === 'BROWSER_INJECT_DARK_THEME') {
+            const style = document.createElement('style');
+            style.id = '__browser_dark_override__';
+            style.textContent = 'html { filter: invert(90%) hue-rotate(180deg) !important; background: #121212 !important; } img, video, canvas, iframe { filter: invert(100%) hue-rotate(180deg) !important; }';
+            document.head.appendChild(style);
+          }
+        });
+      })();
+    </script>
+    <style id="__webview_scrolling_fix__">
+      html, body {
+        min-height: 100% !important;
+        width: 100% !important;
+        -webkit-overflow-scrolling: touch !important;
+        touch-action: pan-x pan-y !important;
+      }
+    </style>
+  `;
+
+  if (head) {
+    head.insertAdjacentHTML('beforeend', bridgeScript);
+  } else {
+    root.insertAdjacentHTML('beforeend', bridgeScript);
+  }
+
+  return root.toString();
+}
+
+// Global variable tracking the most recently active proxied origin for referer-less asset fallbacks
+let lastActiveProxiedOrigin = 'https://google.com';
+
+// -------------------------------------------------------------
+// Dedicated Full YouTube WebView App Experience Generator
+// -------------------------------------------------------------
+function renderYouTubeWebView(targetUrl: string): string {
+  let videoId = '';
+  let searchQuery = '';
+
+  try {
+    const parsed = new URL(targetUrl);
+    if (parsed.searchParams.get('v')) {
+      videoId = parsed.searchParams.get('v')!;
+    } else if (parsed.searchParams.get('search_query')) {
+      searchQuery = parsed.searchParams.get('search_query')!;
+    } else if (parsed.searchParams.get('q')) {
+      searchQuery = parsed.searchParams.get('q')!;
+    }
+  } catch {}
+
+  if (!videoId) {
+    const m = targetUrl.match(/(?:youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
+    if (m) videoId = m[1];
+  }
+
+  // Curated Popular Videos for categories & default feed
+  const curatedVideos = [
+    { id: 'jfKfPfyJRdk', title: 'lofi hip hop radio 📚 beats to relax/study to', channel: 'Lofi Girl', views: '65K watching', time: 'LIVE', duration: 'LIVE', thumb: 'https://i.ytimg.com/vi/jfKfPfyJRdk/hqdefault.jpg', category: 'Music' },
+    { id: '1-xGerv5FOk', title: 'Kurzgesagt – What If We Detonated All Nuclear Bombs at Once?', channel: 'Kurzgesagt – In a Nutshell', views: '28M views', time: '2 years ago', duration: '11:04', thumb: 'https://i.ytimg.com/vi/1-xGerv5FOk/hqdefault.jpg', category: 'Science' },
+    { id: 'DPnqb74Smug', title: 'GothamChess: Magnus Carlsen Does The Impossible Again', channel: 'GothamChess', views: '1.4M views', time: '3 days ago', duration: '14:22', thumb: 'https://i.ytimg.com/vi/DPnqb74Smug/hqdefault.jpg', category: 'Chess' },
+    { id: 'dQw4w9WgXcQ', title: 'Rick Astley - Never Gonna Give You Up (Official Music Video)', channel: 'Rick Astley', views: '1.5B views', time: '14 years ago', duration: '3:33', thumb: 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg', category: 'Music' },
+    { id: 'yX8yrOFlfWA', title: 'Building a Full Stack App in 10 Minutes with AI', channel: 'Fireship', views: '950K views', time: '2 weeks ago', duration: '8:45', thumb: 'https://i.ytimg.com/vi/yX8yrOFlfWA/hqdefault.jpg', category: 'Coding' },
+    { id: 'd0NHOpeczUU', title: 'Neal.fun Infinite Craft World Record Discovery', channel: 'Aliensrock', views: '820K views', time: '1 month ago', duration: '22:15', thumb: 'https://i.ytimg.com/vi/d0NHOpeczUU/hqdefault.jpg', category: 'Gaming' },
+    { id: '4xDzrJKXOOY', title: 'Earth from Space: 4K Ultra HD Relaxing Video with Ambient Music', channel: 'NASA Space & Science', views: '4.2M views', time: '1 year ago', duration: '1:00:00', thumb: 'https://i.ytimg.com/vi/4xDzrJKXOOY/hqdefault.jpg', category: 'Science' },
+    { id: 'k85mRPqvMbE', title: 'Learn TypeScript in 50 Minutes - Full Crash Course', channel: 'freeCodeCamp.org', views: '1.1M views', time: '8 months ago', duration: '51:10', thumb: 'https://i.ytimg.com/vi/k85mRPqvMbE/hqdefault.jpg', category: 'Coding' },
+  ];
+
+  const initialVideo = videoId ? curatedVideos.find(v => v.id === videoId) || {
+    id: videoId,
+    title: 'YouTube Video Player',
+    channel: 'YouTube Video',
+    views: 'HD Streaming',
+    time: 'Now Playing',
+    duration: 'HD',
+    thumb: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    category: 'All'
+  } : null;
+
+  return `
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>${initialVideo ? initialVideo.title : (searchQuery ? `${searchQuery} - YouTube Search` : 'YouTube WebView')}</title>
+        <style>
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body {
+            background-color: #0f0f0f;
+            color: #f1f1f1;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+          }
+          header {
+            position: sticky;
+            top: 0;
+            z-index: 50;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 18px;
+            background: rgba(15, 15, 15, 0.96);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid #272727;
+            gap: 12px;
+          }
+          .logo {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #fff;
+            font-weight: 700;
+            font-size: 17px;
+            text-decoration: none;
+            letter-spacing: -0.3px;
+            flex-shrink: 0;
+          }
+          .logo svg { width: 28px; height: 28px; fill: #ff0000; }
+          .logo-badge {
+            font-size: 10px;
+            background: #272727;
+            color: #38bdf8;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: 600;
+            margin-left: 4px;
+          }
+          .search-form {
+            display: flex;
+            align-items: center;
+            max-width: 540px;
+            width: 100%;
+            flex: 1;
+            margin: 0 12px;
+          }
+          .search-form input {
+            flex: 1;
+            padding: 9px 16px;
+            background: #121212;
+            border: 1px solid #303030;
+            border-radius: 24px 0 0 24px;
+            color: #fff;
+            outline: none;
+            font-size: 14px;
+            transition: border-color 0.15s ease;
+          }
+          .search-form input:focus { border-color: #3ea6ff; }
+          .search-form button {
+            background: #222;
+            border: 1px solid #303030;
+            border-left: none;
+            border-radius: 0 24px 24px 0;
+            padding: 9px 20px;
+            color: #aaa;
+            cursor: pointer;
+            font-size: 14px;
+          }
+          .search-form button:hover { background: #333; color: #fff; }
+          .chips-bar {
+            display: flex;
+            gap: 8px;
+            padding: 10px 18px;
+            background: #0f0f0f;
+            overflow-x: auto;
+            border-bottom: 1px solid #202020;
+            white-space: nowrap;
+            scrollbar-width: none;
+          }
+          .chips-bar::-webkit-scrollbar { display: none; }
+          .chip {
+            padding: 6px 14px;
+            border-radius: 8px;
+            background: #272727;
+            color: #f1f1f1;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+            transition: all 0.15s ease;
+          }
+          .chip:hover, .chip.active {
+            background: #f1f1f1;
+            color: #0f0f0f;
+          }
+          .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 18px;
+            max-width: 1400px;
+            width: 100%;
+            margin: 0 auto;
+          }
+          .player-section {
+            width: 100%;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            margin-bottom: 24px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+          }
+          .player-wrapper {
+            position: relative;
+            padding-bottom: 56.25%; /* 16:9 ratio */
+            height: 0;
+            overflow: hidden;
+          }
+          .player-wrapper iframe {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: 0;
+          }
+          .player-details {
+            padding: 16px 20px;
+            background: #181818;
+            border-top: 1px solid #272727;
+          }
+          .player-title {
+            font-size: 19px;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 8px;
+            line-height: 1.3;
+          }
+          .player-meta {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+            color: #aaa;
+            font-size: 13px;
+          }
+          .channel-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+          }
+          .channel-avatar {
+            width: 38px;
+            height: 38px;
+            border-radius: 50%;
+            background: #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            color: #38bdf8;
+          }
+          .action-btn {
+            background: #272727;
+            color: #fff;
+            border: none;
+            padding: 7px 16px;
+            border-radius: 18px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+          }
+          .action-btn:hover { background: #383838; }
+          .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+          }
+          .video-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 20px 16px;
+          }
+          .video-card {
+            cursor: pointer;
+            text-decoration: none;
+            color: inherit;
+            display: flex;
+            flex-direction: column;
+            border-radius: 10px;
+            overflow: hidden;
+            transition: transform 0.15s ease, opacity 0.15s ease;
+          }
+          .video-card:hover { transform: translateY(-2px); }
+          .video-thumb-container {
+            position: relative;
+            width: 100%;
+            padding-bottom: 56.25%;
+            background: #202020;
+            border-radius: 10px;
+            overflow: hidden;
+          }
+          .video-thumb {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+          }
+          .video-duration {
+            position: absolute;
+            bottom: 6px;
+            right: 6px;
+            background: rgba(0, 0, 0, 0.85);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 5px;
+            border-radius: 4px;
+          }
+          .video-info {
+            padding: 10px 2px 0 2px;
+          }
+          .video-title {
+            font-size: 14px;
+            font-weight: 600;
+            line-height: 1.35;
+            color: #f1f1f1;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            margin-bottom: 4px;
+          }
+          .video-channel {
+            font-size: 12px;
+            color: #aaa;
+            margin-bottom: 2px;
+          }
+          .video-stats {
+            font-size: 12px;
+            color: #888;
+          }
+        </style>
+      </head>
+      <body>
+        <header>
+          <a href="/api/proxy/page?url=https%3A%2F%2Fwww.youtube.com" class="logo">
+            <svg viewBox="0 0 24 24"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
+            <span>YouTube</span>
+            <span class="logo-badge">WebView</span>
+          </a>
+          <form class="search-form" onsubmit="handleSearchSubmit(event)">
+            <input type="text" id="yt-search-input" value="${searchQuery}" placeholder="Search YouTube or paste URL..." />
+            <button type="submit">🔍</button>
+          </form>
+          <a href="${targetUrl}" target="_blank" class="action-btn">↗ External</a>
+        </header>
+
+        <div class="chips-bar">
+          <button class="chip active" onclick="filterCategory('All', this)">All</button>
+          <button class="chip" onclick="filterCategory('Music', this)">Music</button>
+          <button class="chip" onclick="filterCategory('Gaming', this)">Gaming</button>
+          <button class="chip" onclick="filterCategory('Science', this)">Science</button>
+          <button class="chip" onclick="filterCategory('Chess', this)">Chess</button>
+          <button class="chip" onclick="filterCategory('Coding', this)">Coding</button>
+        </div>
+
+        <div class="main-content">
+          ${initialVideo ? `
+            <div class="player-section">
+              <div class="player-wrapper">
+                <iframe
+                  id="active-player"
+                  src="https://www.youtube-nocookie.com/embed/${initialVideo.id}?autoplay=1&enablejsapi=1&rel=0&modestbranding=1"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share; fullscreen"
+                  allowfullscreen
+                ></iframe>
+              </div>
+              <div class="player-details">
+                <div class="player-title">${initialVideo.title}</div>
+                <div class="player-meta">
+                  <div class="channel-info">
+                    <div class="channel-avatar">${initialVideo.channel.slice(0, 1)}</div>
+                    <div>
+                      <div style="font-weight:600;color:#fff;">${initialVideo.channel}</div>
+                      <div>${initialVideo.views} • ${initialVideo.time}</div>
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;">
+                    <button class="action-btn" onclick="navigator.clipboard.writeText('https://www.youtube.com/watch?v=${initialVideo.id}')">📋 Copy Link</button>
+                    <a href="https://www.youtube.com/watch?v=${initialVideo.id}" target="_blank" class="action-btn">Open in YouTube ↗</a>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ` : ''}
+
+          <div class="section-title">
+            <span>${searchQuery ? `Search Results for "${searchQuery}"` : (initialVideo ? 'Recommended Videos' : 'Trending on YouTube')}</span>
+          </div>
+
+          <div class="video-grid" id="video-grid">
+            ${curatedVideos.map((video) => `
+              <div class="video-card" data-category="${video.category}" onclick="playVideo('${video.id}', '${encodeURIComponent(video.title)}')">
+                <div class="video-thumb-container">
+                  <img class="video-thumb" src="${video.thumb}" alt="${video.title}" loading="lazy" />
+                  <div class="video-duration">${video.duration}</div>
+                </div>
+                <div class="video-info">
+                  <div class="video-title">${video.title}</div>
+                  <div class="video-channel">${video.channel}</div>
+                  <div class="video-stats">${video.views} • ${video.time}</div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+
+        <script>
+          const TARGET_URL = ${JSON.stringify(targetUrl)};
+          const CURRENT_VIDEO_ID = ${JSON.stringify(videoId || '')};
+
+          function playVideo(id, title) {
+            const newUrl = 'https://www.youtube.com/watch?v=' + id;
+            location.href = '/api/proxy/page?url=' + encodeURIComponent(newUrl);
+          }
+
+          function handleSearchSubmit(e) {
+            e.preventDefault();
+            const q = document.getElementById('yt-search-input').value.trim();
+            if (!q) return;
+            if (q.startsWith('http://') || q.startsWith('https://')) {
+              location.href = '/api/proxy/page?url=' + encodeURIComponent(q);
+            } else {
+              location.href = '/api/proxy/page?url=' + encodeURIComponent('https://www.youtube.com/results?search_query=' + encodeURIComponent(q));
+            }
+          }
+
+          function filterCategory(cat, el) {
+            document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+            if (el) el.classList.add('active');
+            const cards = document.querySelectorAll('.video-card');
+            cards.forEach(card => {
+              if (cat === 'All' || card.getAttribute('data-category') === cat) {
+                card.style.display = 'flex';
+              } else {
+                card.style.display = 'none';
+              }
+            });
+          }
+
+          try {
+            window.parent.postMessage({
+              type: 'BROWSER_PAGE_LOADED',
+              url: TARGET_URL,
+              title: ${JSON.stringify(initialVideo ? initialVideo.title : 'YouTube')},
+              favicon: 'https://www.youtube.com/favicon.ico'
+            }, '*');
+          } catch(e) {}
+        </script>
+      </body>
+    </html>
+  `;
+}
+
+// -------------------------------------------------------------
 // 4. HTML Proxy with Form POST, Redirects, Cookies & Anti-Detection
 // -------------------------------------------------------------
 app.all('/api/proxy/page', async (req, res) => {
-  const targetUrl = (req.query.url || req.body.__proxy_target_url) as string;
-  const userAgent = (req.query.userAgent as string) || (req.body.__proxy_user_agent as string) || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-  const blockAds = req.query.blockAds === 'true' || req.body.__proxy_block_ads === 'true';
+  let targetUrl = (req.query.url || req.body?.__proxy_target_url) as string;
+  const userAgent = (req.query.userAgent as string) || (req.body?.__proxy_user_agent as string) || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  const blockAds = req.query.blockAds === 'true' || req.body?.__proxy_block_ads === 'true';
 
   if (!targetUrl) {
     return res.status(400).send('<h1>400 Bad Request</h1><p>Missing URL parameter.</p>');
+  }
+
+  // Ensure scheme
+  if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+    targetUrl = 'https://' + targetUrl;
   }
 
   const check = isSafeUrl(targetUrl);
@@ -555,16 +1375,31 @@ app.all('/api/proxy/page', async (req, res) => {
     `);
   }
 
+  // Track active proxied origin for referer-less asset fallbacks
+  try {
+    lastActiveProxiedOrigin = targetUrl;
+  } catch {}
+
+  // YouTube Intelligent WebView Interception
+  if (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be')) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
+    res.removeHeader('Cross-Origin-Opener-Policy');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.send(renderYouTubeWebView(targetUrl));
+  }
+
   try {
     // Prepare request method & body (supports Form POST submissions)
     const method = req.method;
     let body: any = undefined;
     const reqHeaders: Record<string, string> = {};
 
-    if (method === 'POST') {
+    if (method === 'POST' && req.body) {
       const contentType = req.headers['content-type'] || '';
       if (contentType.includes('application/x-www-form-urlencoded')) {
-        // Exclude internal proxy fields
         const params = new URLSearchParams();
         for (const [key, value] of Object.entries(req.body)) {
           if (!key.startsWith('__proxy_')) {
@@ -595,214 +1430,18 @@ app.all('/api/proxy/page', async (req, res) => {
       return res.send(Buffer.from(buffer));
     }
 
-    let html = await response.text();
-    const root = parse(html);
-
-    // Ensure <head> exists
-    let head = root.querySelector('head');
-    if (!head) {
-      const bodyEl = root.querySelector('body');
-      if (bodyEl) {
-        bodyEl.insertAdjacentHTML('beforebegin', '<head></head>');
-        head = root.querySelector('head');
-      }
-    }
-
-    if (head) {
-      head.querySelectorAll('base').forEach((b) => b.remove());
-    }
-
-    // Rewrite anchor links
-    root.querySelectorAll('a').forEach((el) => {
-      const href = el.getAttribute('href');
-      if (href && !href.startsWith('#') && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
-        try {
-          const absolute = new URL(href, finalUrl).toString();
-          el.setAttribute('href', `/api/proxy/page?url=${encodeURIComponent(absolute)}&blockAds=${blockAds}`);
-          el.setAttribute('target', '_self');
-          el.setAttribute('data-original-href', absolute);
-        } catch {}
-      }
-    });
-
-    // Rewrite forms (support both GET and POST submissions via proxy)
-    root.querySelectorAll('form').forEach((el) => {
-      const action = el.getAttribute('action') || '';
-      try {
-        const absolute = new URL(action, finalUrl).toString();
-        el.setAttribute('action', `/api/proxy/page`);
-        el.setAttribute('data-original-action', absolute);
-        
-        // Inject hidden proxy target URL
-        el.insertAdjacentHTML('afterbegin', `
-          <input type="hidden" name="__proxy_target_url" value="${encodeURIComponent(absolute)}" />
-          <input type="hidden" name="__proxy_user_agent" value="${userAgent}" />
-          <input type="hidden" name="__proxy_block_ads" value="${blockAds ? 'true' : 'false'}" />
-        `);
-      } catch {}
-    });
-
-    // Rewrite stylesheets and links
-    root.querySelectorAll('link').forEach((el) => {
-      const href = el.getAttribute('href');
-      if (href) {
-        if (blockAds && isAdDomain(href)) {
-          el.remove();
-          return;
-        }
-        try {
-          const absolute = new URL(href, finalUrl).toString();
-          el.setAttribute('href', `/api/proxy/asset?url=${encodeURIComponent(absolute)}`);
-        } catch {}
-      }
-    });
-
-    // Rewrite scripts
-    root.querySelectorAll('script').forEach((el) => {
-      const src = el.getAttribute('src');
-      if (src) {
-        if (blockAds && isAdDomain(src)) {
-          el.remove();
-          return;
-        }
-        try {
-          const absolute = new URL(src, finalUrl).toString();
-          el.setAttribute('src', `/api/proxy/asset?url=${encodeURIComponent(absolute)}`);
-        } catch {}
-      }
-    });
-
-    // Rewrite images, videos, audio, source, iframe
-    root.querySelectorAll('img, video, audio, source, iframe').forEach((el) => {
-      const src = el.getAttribute('src');
-      if (src) {
-        if (blockAds && isAdDomain(src)) {
-          el.remove();
-          return;
-        }
-        try {
-          const absolute = new URL(src, finalUrl).toString();
-          el.setAttribute('src', `/api/proxy/asset?url=${encodeURIComponent(absolute)}`);
-        } catch {}
-      }
-      const srcset = el.getAttribute('srcset');
-      if (srcset) {
-        try {
-          const newSrcset = srcset.split(',').map((part) => {
-            const [url, size] = part.trim().split(/\s+/);
-            if (!url) return part;
-            const absolute = new URL(url, finalUrl).toString();
-            return `${`/api/proxy/asset?url=${encodeURIComponent(absolute)}`} ${size || ''}`.trim();
-          }).join(', ');
-          el.setAttribute('srcset', newSrcset);
-        } catch {}
-      }
-    });
-
-    // Detect if this page is a Google login or OAuth authentication endpoint
-    const isGoogleAuthPage = finalUrl.includes('accounts.google.com') || finalUrl.includes('google.com/signin');
-
-    // Injected Client-Side Bridge Script
-    const bridgeScript = `
-      <script id="__browser_proxy_bridge__">
-        (function() {
-          const CURRENT_URL = ${JSON.stringify(finalUrl)};
-          const IS_GOOGLE_AUTH = ${isGoogleAuthPage ? 'true' : 'false'};
-
-          // Notify parent of successful page load & authentication detection
-          try {
-            window.parent.postMessage({
-              type: 'BROWSER_PAGE_LOADED',
-              url: CURRENT_URL,
-              title: document.title || CURRENT_URL,
-              favicon: (document.querySelector("link[rel*='icon']") || {}).href || '',
-              isAuthPage: IS_GOOGLE_AUTH || CURRENT_URL.includes('login') || CURRENT_URL.includes('signin') || CURRENT_URL.includes('oauth')
-            }, '*');
-          } catch(e) {}
-
-          // Intercept OAuth and Popup window.open calls
-          const originalOpen = window.open;
-          window.open = function(url, target, features) {
-            try {
-              const fullUrl = new URL(url, CURRENT_URL).toString();
-              window.parent.postMessage({
-                type: 'BROWSER_POPUP_REQUESTED',
-                url: fullUrl,
-                target: target || '_blank'
-              }, '*');
-              return null;
-            } catch(e) {
-              return originalOpen.apply(this, arguments);
-            }
-          };
-
-          // Observe title changes
-          try {
-            const titleEl = document.querySelector('title');
-            if (titleEl) {
-              const observer = new MutationObserver(function() {
-                window.parent.postMessage({
-                  type: 'BROWSER_TITLE_CHANGED',
-                  title: document.title,
-                  url: CURRENT_URL
-                }, '*');
-              });
-              observer.observe(titleEl, { childList: true, characterData: true, subtree: true });
-            }
-          } catch(e) {}
-
-          // Intercept dynamic clicks
-          document.addEventListener('click', function(e) {
-            const anchor = e.target.closest('a');
-            if (anchor && anchor.href) {
-              const href = anchor.getAttribute('data-original-href') || anchor.href;
-              if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('#')) {
-                window.parent.postMessage({
-                  type: 'BROWSER_LINK_CLICKED',
-                  url: href
-                }, '*');
-              }
-            }
-          }, true);
-
-          // Handle form submissions dynamically
-          document.addEventListener('submit', function(e) {
-            const form = e.target;
-            const originalAction = form.getAttribute('data-original-action') || form.action;
-            if (originalAction && !form.querySelector('input[name="__proxy_target_url"]')) {
-              const hidden = document.createElement('input');
-              hidden.type = 'hidden';
-              hidden.name = '__proxy_target_url';
-              hidden.value = originalAction;
-              form.appendChild(hidden);
-            }
-          }, true);
-
-          // Listen for parent messages
-          window.addEventListener('message', function(event) {
-            if (event.data && event.data.type === 'BROWSER_INJECT_DARK_THEME') {
-              const style = document.createElement('style');
-              style.id = '__browser_dark_override__';
-              style.textContent = 'html { filter: invert(90%) hue-rotate(180deg) !important; background: #121212 !important; } img, video, canvas, iframe { filter: invert(100%) hue-rotate(180deg) !important; }';
-              document.head.appendChild(style);
-            }
-          });
-        })();
-      </script>
-    `;
-
-    if (head) {
-      head.insertAdjacentHTML('beforeend', bridgeScript);
-    } else {
-      root.insertAdjacentHTML('beforeend', bridgeScript);
-    }
+    const rawHtml = await response.text();
+    const rewrittenHtml = rewriteHtmlPage(rawHtml, finalUrl, blockAds, userAgent);
 
     // Send the rewritten HTML
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.removeHeader('X-Frame-Options');
     res.removeHeader('Content-Security-Policy');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
+    res.removeHeader('Cross-Origin-Opener-Policy');
+    res.removeHeader('Cross-Origin-Resource-Policy');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.send(root.toString());
+    res.send(rewrittenHtml);
   } catch (err: any) {
     res.status(502).send(`
       <!DOCTYPE html>
@@ -839,10 +1478,10 @@ app.all('/api/proxy/page', async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 5. Asset Proxy (CSS, JS, Fonts, Images, Media)
+// 5. Asset Proxy (CSS, JS, Fonts, Images, Media, Sub-HTML, API Calls)
 // -------------------------------------------------------------
-app.get('/api/proxy/asset', async (req, res) => {
-  const targetUrl = req.query.url as string;
+app.all('/api/proxy/asset', async (req, res) => {
+  const targetUrl = (req.query.url || req.body?.__proxy_target_url) as string;
   if (!targetUrl) {
     return res.status(400).send('Missing URL');
   }
@@ -856,22 +1495,41 @@ app.get('/api/proxy/asset', async (req, res) => {
     const headers = getBrowserHeaders(targetUrl);
     headers['Accept'] = '*/*';
 
-    const response = await fetch(targetUrl, {
+    let body: any = undefined;
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
+      body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    }
+
+    const { response, finalUrl } = await fetchWithRedirects(targetUrl, {
+      method: req.method,
+      body,
       headers,
+      isAsset: true,
     });
 
     const contentType = response.headers.get('content-type') || 'application/octet-stream';
     res.setHeader('Content-Type', contentType);
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
+    res.removeHeader('Cross-Origin-Opener-Policy');
     res.setHeader('Cache-Control', 'public, max-age=86400');
+
+    // If it's HTML, rewrite it
+    if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml')) {
+      const rawHtml = await response.text();
+      const rewritten = rewriteHtmlPage(rawHtml, finalUrl, false, headers['User-Agent']);
+      return res.send(rewritten);
+    }
 
     // If CSS, rewrite url(...) definitions inside the stylesheet
     if (contentType.includes('text/css')) {
       let cssText = await response.text();
       cssText = cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote, url) => {
-        if (url.startsWith('data:') || url.startsWith('#')) return match;
+        if (url.startsWith('data:') || url.startsWith('#') || url.startsWith('blob:')) return match;
         try {
-          const absolute = new URL(url, targetUrl).toString();
+          const absolute = new URL(url, finalUrl).toString();
           return `url("/api/proxy/asset?url=${encodeURIComponent(absolute)}")`;
         } catch {
           return match;
@@ -966,6 +1624,111 @@ ${cleanContent}`;
     });
   } catch (err: any) {
     res.status(500).json({ error: `AI analysis failed: ${err.message}` });
+  }
+});
+
+// -------------------------------------------------------------
+// 7. Catch-All Referer Proxy: Routes relative requests from proxied pages (SPAs, Next.js chunks, Neal.fun, YouTube sub-requests)
+// -------------------------------------------------------------
+app.use(async (req, res, next) => {
+  // Ignore API endpoints, Vite internal paths, root, and app entry points
+  if (
+    req.path.startsWith('/api/') ||
+    req.path.startsWith('/src/') ||
+    req.path.startsWith('/@') ||
+    req.path.startsWith('/node_modules/') ||
+    req.path === '/' ||
+    req.path === '/index.html' ||
+    req.path === '/favicon.ico'
+  ) {
+    return next();
+  }
+
+  // Check if this request originated from a proxied page iframe
+  const referer = (req.headers['referer'] as string) || '';
+  let targetOriginUrl = '';
+
+  if (referer.includes('/api/proxy/page')) {
+    try {
+      const refUrl = new URL(referer, `http://localhost:${PORT}`);
+      const pageUrl = refUrl.searchParams.get('url');
+      if (pageUrl) {
+        targetOriginUrl = pageUrl;
+      }
+    } catch {}
+  } else if (referer.includes('/api/proxy/asset')) {
+    try {
+      const refUrl = new URL(referer, `http://localhost:${PORT}`);
+      const assetUrl = refUrl.searchParams.get('url');
+      if (assetUrl) {
+        targetOriginUrl = assetUrl;
+      }
+    } catch {}
+  }
+
+  // Fallback to the most recently active proxied origin
+  if (!targetOriginUrl && lastActiveProxiedOrigin) {
+    targetOriginUrl = lastActiveProxiedOrigin;
+  }
+
+  if (!targetOriginUrl) {
+    return next();
+  }
+
+  try {
+    const fullTargetUrl = new URL(req.originalUrl, targetOriginUrl).toString();
+    const check = isSafeUrl(fullTargetUrl);
+    if (!check.safe) {
+      return res.status(403).send('Forbidden');
+    }
+
+    let body: any = undefined;
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
+      body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    }
+
+    const { response, finalUrl } = await fetchWithRedirects(fullTargetUrl, {
+      method: req.method,
+      body,
+      userAgent: req.headers['user-agent'] as string,
+      isAsset: true,
+    });
+
+    const contentType = response.headers.get('content-type') || 'application/octet-stream';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
+    res.removeHeader('Cross-Origin-Opener-Policy');
+    res.removeHeader('Cross-Origin-Resource-Policy');
+
+    // If HTML, rewrite it with the proxy rewriter
+    if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml')) {
+      const rawHtml = await response.text();
+      const rewritten = rewriteHtmlPage(rawHtml, finalUrl, false, req.headers['user-agent'] as string);
+      return res.send(rewritten);
+    }
+
+    // If CSS, rewrite url(...) definitions
+    if (contentType.includes('text/css')) {
+      let cssText = await response.text();
+      cssText = cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote, url) => {
+        if (url.startsWith('data:') || url.startsWith('#') || url.startsWith('blob:')) return match;
+        try {
+          const absolute = new URL(url, finalUrl).toString();
+          return `url("/api/proxy/asset?url=${encodeURIComponent(absolute)}")`;
+        } catch {
+          return match;
+        }
+      });
+      return res.send(cssText);
+    }
+
+    const buffer = await response.arrayBuffer();
+    return res.send(Buffer.from(buffer));
+  } catch (err: any) {
+    return res.status(502).send(`Proxy fetch error: ${err.message}`);
   }
 });
 

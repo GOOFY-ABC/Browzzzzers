@@ -23,6 +23,7 @@ import {
   HelpCircle,
   Search,
   Key,
+  Tv,
 } from 'lucide-react';
 import { SEARCH_ENGINES } from '../lib/constants';
 import { normalizeUrl } from '../lib/urlHelper';
@@ -235,6 +236,50 @@ export const AddressBar: React.FC<AddressBarProps> = ({
                 <Shield className="w-2.5 h-2.5" />
                 <span>Shield</span>
               </div>
+            )}
+
+            {/* YouTube Clean Player / Embed Mode Toggle */}
+            {!isInternal && (activeTab.url.includes('youtube.com') || activeTab.url.includes('youtu.be')) && (
+              <button
+                type="button"
+                id="btn-youtube-theater"
+                onClick={() => {
+                  if (activeTab.url.includes('/embed/')) {
+                    const match = activeTab.url.match(/embed\/([a-zA-Z0-9_-]+)/);
+                    if (match && match[1]) {
+                      onNavigate(`https://www.youtube.com/watch?v=${match[1]}`);
+                    }
+                  } else {
+                    let videoId = '';
+                    if (activeTab.url.includes('watch')) {
+                      try {
+                        const parsed = new URL(activeTab.url);
+                        videoId = parsed.searchParams.get('v') || '';
+                      } catch {}
+                    } else if (activeTab.url.includes('youtu.be/')) {
+                      const match = activeTab.url.match(/youtu\.be\/([a-zA-Z0-9_-]+)/);
+                      if (match) videoId = match[1];
+                    }
+                    if (videoId) {
+                      onNavigate(`https://www.youtube.com/embed/${videoId}?autoplay=1`);
+                    } else {
+                      onNavigate('https://www.youtube.com');
+                    }
+                  }
+                }}
+                className={`p-1 rounded transition-colors ${
+                  activeTab.url.includes('/embed/')
+                    ? 'text-red-400 bg-red-500/20 ring-1 ring-red-400/40'
+                    : 'text-slate-400 hover:text-red-400 hover:bg-slate-800'
+                }`}
+                title={
+                  activeTab.url.includes('/embed/')
+                    ? 'Switch to YouTube Web View'
+                    : 'Switch to Clean YouTube Embed Player (Fast & Ad-Free)'
+                }
+              >
+                <Tv className="w-3.5 h-3.5" />
+              </button>
             )}
 
             {/* Auth / Login Assistant Button */}
